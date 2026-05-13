@@ -1,0 +1,241 @@
+
+import * as THREE from 'three/webgpu';
+import { pass, mrt, output, normalView, diffuseColor, velocity, add, vec3, vec4, directionToColor, colorToDirection, sample } from 'three/tsl';
+import { ssgi } from 'three/addons/tsl/display/SSGINode.js';
+import { traa } from 'three/addons/tsl/display/TRAANode.js';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { Inspector } from 'three/addons/inspector/Inspector.js';
+
+// csm shadow node
+import { CSMShadowNode } from './src/CSMShadowNode.js';
+
+let camera, scene, renderer, renderPipeline, controls;
+let width = 400;
+let height = 300;
+
+initCamera();
+initRenderer();
+initScene();
+initLighting();
+initPipeline();
+initCSM();
+
+function initLighting() {
+  // Ambient light
+  const ambientLight = new THREE.AmbientLight( '#0c0c0c' );
+  scene.add( ambientLight );
+}
+
+function initCamera() {
+  camera = new THREE.PerspectiveCamera( 40, width / height, 0.1, 100 );
+  camera.position.set( 0, 10, 30 );
+}
+
+function initRenderer() {
+  renderer = new THREE.WebGPURenderer();
+  renderer.setSize( width, height );
+  renderer.setAnimationLoop( animate );
+  renderer.shadowMap.enabled = true;
+  renderer.inspector = new Inspector();
+  document.body.appendChild( renderer.domElement );
+}
+
+function initPipeline() {
+  // controls
+  controls = new OrbitControls( camera, renderer.domElement );
+  controls.target.set( 0, 7, 0 );
+  controls.enablePan = true;
+  controls.minDistance = 1;
+  controls.maxDistance = 100;
+  controls.update();
+
+  // render pipeline
+  renderPipeline = new THREE.RenderPipeline( renderer );
+  const scenePass = pass( scene, camera );
+  scenePass.setMRT( mrt( {
+    output: output,
+    diffuseColor: diffuseColor,
+    normal: directionToColor( normalView ),
+    velocity: velocity
+  } ) );
+  const scenePassColor = scenePass.getTextureNode( 'output' );
+  const scenePassDiffuse = scenePass.getTextureNode( 'diffuseColor' ).toInspector( 'Diffuse Color' );
+  const scenePassDepth = scenePass.getTextureNode( 'depth' ).toInspector( 'Depth', () => {
+    return scenePass.getLinearDepthNode();
+  } );
+  const scenePassNormal = scenePass.getTextureNode( 'normal' ).toInspector( 'Normal' );
+  const scenePassVelocity = scenePass.getTextureNode( 'velocity' ).toInspector( 'Velocity' );
+
+  // bandwidth optimization
+  const diffuseTexture = scenePass.getTexture( 'diffuseColor' );
+  diffuseTexture.type = THREE.UnsignedByteType;
+  const normalTexture = scenePass.getTexture( 'normal' );
+  normalTexture.type = THREE.UnsignedByteType;
+  const sceneNormal = sample( ( uv ) => {
+    return colorToDirection( scenePassNormal.sample( uv ) );
+  } );
+
+  // gi
+  const giPass = ssgi( scenePassColor, scenePassDepth, sceneNormal, camera );
+  giPass.sliceCount.value = 2;
+  giPass.stepCount.value = 8;
+
+  // composite
+  const gi = giPass.rgb.toInspector( 'SSGI' );
+  const ao = giPass.a.toInspector( 'AO' );
+  const compositePass = vec4( add( scenePassColor.rgb.mul( ao ), ( scenePassDiffuse.rgb.mul( gi ) ) ), scenePassColor.a );
+  compositePass.name = 'Composite';
+
+  // traa
+  const traaPass = traa( compositePass, scenePassDepth, scenePassVelocity, camera );
+  renderPipeline.outputNode = traaPass;
+
+  //
+  const params = {
+    output: 0
+  };
+
+  const types = { Combined: 0, Direct: 3, AO: 1, GI: 2 };
+
+  const gui = renderer.inspector.createParameters( 'SSGI settings' );
+  gui.add( params, 'output', types ).onChange( updatePostprocessing );
+  gui.add( giPass.sliceCount, 'value', 1, 4, 1 ).name( 'slice count' );
+  gui.add( giPass.stepCount, 'value', 1, 32, 1 ).name( 'step count' );
+  gui.add( giPass.radius, 'value', 1, 25 ).name( 'radius' );
+  gui.add( giPass.expFactor, 'value', 1, 3 ).name( 'exp factor' );
+  gui.add( giPass.thickness, 'value', 0.01, 10 ).name( 'thickness' );
+  gui.add( giPass.backfaceLighting, 'value', 0, 1 ).name( 'backface lighting' );
+  gui.add( giPass.aoIntensity, 'value', 0, 4 ).name( 'AO intensity' );
+  gui.add( giPass.giIntensity, 'value', 0, 100 ).name( 'GI intensity' );
+  gui.add( giPass.useLinearThickness, 'value' ).name( 'use linear thickness' );
+  gui.add( giPass.useScreenSpaceSampling, 'value' ).name( 'screen-space sampling' );
+  gui.add( giPass, 'useTemporalFiltering' ).name( 'temporal filtering' ).onChange( updatePostprocessing );
+
+  function updatePostprocessing( value ) {
+    if ( value === 1 ) {
+      renderPipeline.outputNode = vec4( vec3( ao ), 1 );
+    } else if ( value === 2 ) {
+      renderPipeline.outputNode = vec4( gi, 1 );
+    } else if ( value === 3 ) {
+      renderPipeline.outputNode = scenePassColor;
+    } else {
+      renderPipeline.outputNode = giPass.useTemporalFiltering ? traaPass : compositePass;
+    }
+    renderPipeline.needsUpdate = true;
+  }
+}
+
+function initCSM() {
+  const csmDirLight = new THREE.DirectionalLight( 0xFFFFFF, 5, 20 );
+  csmDirLight.position.set( 7, 3, -2 );
+  csmDirLight.castShadow = true;
+  csmDirLight.shadow.mapSize.width = 1024;
+  csmDirLight.shadow.mapSize.height = 1024;
+  csmDirLight.shadow.camera.left = -20;
+  csmDirLight.shadow.camera.bottom = -20;
+  csmDirLight.shadow.camera.right = 20;
+  csmDirLight.shadow.camera.top = 20;
+  scene.add( csmDirLight );
+  const csm = new CSMShadowNode(csmDirLight, {
+    mode: 'uniform',
+    maxFar: 200
+  });
+  // csmDirLight.shadow.shadowNode = csm;
+
+  setTimeout(() => {
+    /*
+    const csmDirLight = new THREE.DirectionalLight( '#0000ff', 5, 20 );
+    csmDirLight.position.set( -7, 3, -2 );
+    csmDirLight.castShadow = true;
+    csmDirLight.shadow.mapSize.width = 1024;
+    csmDirLight.shadow.mapSize.height = 1024;
+    scene.add( csmDirLight );
+    const csm = new CSMShadowNode(csmDirLight, {
+      mode: 'uniform',
+      maxFar: 200
+    });
+    csmDirLight.shadow.shadowNode = csm;
+    */
+  }, 1000);
+}
+
+function initScene() {
+  scene = new THREE.Scene();
+  scene.background = new THREE.Color( 0xaaaaaa );
+
+  // Walls
+  const wallGeometry = new THREE.PlaneGeometry( 1, 1 );
+
+  // Left wall - red
+  const redWallMaterial = new THREE.MeshPhysicalMaterial( { color: '#ff0000' } );
+  const leftWall = new THREE.Mesh( wallGeometry, redWallMaterial );
+  leftWall.scale.set( 20, 15, 1 );
+  leftWall.rotation.y = Math.PI * 0.5;
+  leftWall.position.set( - 10, 7.5, 0 );
+  leftWall.receiveShadow = true;
+  scene.add( leftWall );
+
+  // Right wall - green
+  const greenWallMaterial = new THREE.MeshPhysicalMaterial( { color: '#00ff00' } );
+  const rightWall = new THREE.Mesh( wallGeometry, greenWallMaterial );
+  rightWall.scale.set( 20, 15, 1 );
+  rightWall.rotation.y = Math.PI * - 0.5;
+  rightWall.position.set( 10, 7.5, 0 );
+  rightWall.receiveShadow = true;
+  scene.add( rightWall );
+
+  // White walls and boxes
+  const whiteMaterial = new THREE.MeshPhysicalMaterial( { color: '#fff' } );
+
+  // Floor
+  const floor = new THREE.Mesh( wallGeometry, whiteMaterial );
+  floor.scale.set( 20, 20, 1 );
+  floor.rotation.x = Math.PI * - .5;
+  floor.receiveShadow = true;
+  scene.add( floor );
+
+  // Back wall
+  const backWall = new THREE.Mesh( wallGeometry, whiteMaterial );
+  backWall.scale.set( 15, 20, 1 );
+  backWall.rotation.z = Math.PI * - 0.5;
+  backWall.position.set( 0, 7.5, - 10 );
+  backWall.receiveShadow = true;
+  scene.add( backWall );
+
+  // Ceiling
+  const ceiling = new THREE.Mesh( wallGeometry, whiteMaterial );
+  ceiling.scale.set( 20, 20, 1 );
+  ceiling.rotation.x = Math.PI * 0.5;
+  ceiling.position.set( 0, 15, 0 );
+  ceiling.receiveShadow = true;
+  scene.add( ceiling );
+
+  // Boxes
+  const tallBoxGeometry = new THREE.BoxGeometry( 5, 7, 5 );
+  const tallBox = new THREE.Mesh( tallBoxGeometry, whiteMaterial );
+  tallBox.rotation.y = Math.PI * 0.25;
+  tallBox.position.set( - 3, 3.5, - 2 );
+  tallBox.castShadow = true;
+  tallBox.receiveShadow = true;
+  scene.add( tallBox );
+
+  const shortBoxGeometry = new THREE.BoxGeometry( 4, 4, 4 );
+  const shortBox = new THREE.Mesh( shortBoxGeometry, whiteMaterial );
+  shortBox.rotation.y = Math.PI * - 0.1;
+  shortBox.position.set( 4, 2, 4 );
+  shortBox.castShadow = true;
+  shortBox.receiveShadow = true;
+  scene.add( shortBox );
+
+  // Light source geometry
+  const lightSourceGeometry = new THREE.CylinderGeometry( 2.5, 2.5, 1, 64 );
+  const lightSourceMaterial = new THREE.MeshBasicMaterial();
+  const lightSource = new THREE.Mesh( lightSourceGeometry, lightSourceMaterial );
+  lightSource.position.y = 15;
+  scene.add( lightSource );
+}
+
+function animate() {
+  controls.update();
+  renderPipeline.render();
+}
